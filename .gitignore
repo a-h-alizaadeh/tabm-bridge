@@ -1,0 +1,25 @@
+# Python & Environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Heavy ML Artifacts (Store on Google Drive, NOT GitHub)
+/data/
+/local/
+/artifacts/
+/checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.parquet
+*.csv
+
+# IDE & OS
+.vscode/
+.DS_Store
+Thumbs.db

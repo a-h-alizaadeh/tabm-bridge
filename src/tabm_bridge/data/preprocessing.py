@@ -60,14 +60,7 @@ def _transform_num_noisy_quantile(
     x_num: dict[str, np.ndarray],
     seed: int = 0,
 ) -> dict[str, np.ndarray] | None:
-    """Official 5-step noisy-quantile numerical preprocessing (lib/data.py & example.ipynb).
-
-    1. Add N(0, 1e-5) noise ONLY to a copy of train before QuantileTransformer.fit().
-    2. Transform raw (un-noised) train, val, and test splits.
-    3. Replace NaNs with 0.0 (mean of standard normal) AFTER normalization.
-    4. Drop numerical columns that have only 1 unique value in train.
-    5. Cast to float32 and assert finite values (fixing the official repo's NaN-check bug).
-    """
+    """Official 5-step noisy-quantile numerical preprocessing (paper/lib/data.py)."""
     x_train_raw = np.asarray(x_num["train"], dtype=np.float32)
     n_train = x_train_raw.shape[0]
     n_quantiles = max(min(n_train // 30, 1000), 10)
@@ -91,7 +84,6 @@ def _transform_num_noisy_quantile(
         arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
         transformed[split_name] = arr
 
-    # Drop constant columns based strictly on train split
     keep_cols = [
         j
         for j in range(transformed["train"].shape[1])
@@ -105,7 +97,9 @@ def _transform_num_noisy_quantile(
             transformed[split_name][:, keep_cols], dtype=np.float32
         )
         if not np.isfinite(transformed[split_name]).all():
-            raise ValueError(f"Non-finite values remain in x_num['{split_name}'] after preprocessing.")
+            raise ValueError(
+                f"Non-finite values remain in x_num['{split_name}'] after preprocessing."
+            )
 
     return transformed
 
@@ -130,11 +124,7 @@ def _sanitize_cat_array(arr: np.ndarray) -> np.ndarray:
 def _transform_cat_oov_safe(
     x_cat: dict[str, np.ndarray],
 ) -> tuple[dict[str, np.ndarray], list[int]]:
-    """Official OOV-safe OrdinalEncoder fitted strictly on train (lib/data.py).
-
-    Unknown categories in val/test are mapped to `cardinality[j]`, which pairs with
-    TabMModel's `F.one_hot(..., card + 1)[..., :-1]` to emit all-zero vectors.
-    """
+    """Official OOV-safe OrdinalEncoder fitted strictly on train (paper/lib/data.py)."""
     unknown_sentinel = np.iinfo(np.int64).max - 3
     train_clean = _sanitize_cat_array(x_cat["train"])
 
@@ -162,16 +152,16 @@ def _transform_cat_oov_safe(
 def _convert_bin_to_cat(
     x_bin: dict[str, np.ndarray],
 ) -> tuple[dict[str, np.ndarray] | None, list[int]]:
-    """Official binary feature handling (paper/bin/model.py).
+    """Official binary feature handling (paper/bin/model.py) with strict train-only rules.
 
-    Drops binary columns with only 1 unique value in train, converts remaining
-    columns to int64, and prepares them to be appended to x_cat (cardinality 2).
+    Never inspects val or test splits to choose the encoding policy. Any unexpected or NaN
+    entry in val/test maps safely to OOV sentinel index 2 (all-zero one-hot vector).
     """
     train_bin = np.asarray(x_bin["train"])
     if train_bin.ndim == 1:
         train_bin = train_bin[:, None]
 
-    keep_cols = []
+    keep_cols: list[int] = []
     for j in range(train_bin.shape[1]):
         col = train_bin[:, j]
         valid = col[~np.isnan(col)] if np.issubdtype(col.dtype, np.floating) else col
@@ -181,24 +171,31 @@ def _convert_bin_to_cat(
     if not keep_cols:
         return None, []
 
-    # Use OOV-safe ordinal encoding on kept binary columns so non-{0,1} or NaN values
-    # in val/test never crash int64 indexing while preserving cardinality=2 for standard {0,1}.
-    sub_bin = {s: np.asarray(x_bin[s])[:, keep_cols] for s in ("train", "val", "test")}
+    sub_bin: dict[str, np.ndarray] = {}
+    for s in ("train", "val", "test"):
+        arr = np.asarray(x_bin[s])
+        if arr.ndim == 1:
+            arr = arr[:, None]
+        sub_bin[s] = arr[:, keep_cols]
+
     train_vals = sub_bin["train"]
-    is_clean_binary = (
-        np.all(np.isfinite(train_vals))
+    train_is_clean_binary = (
+        np.issubdtype(train_vals.dtype, np.number)
+        and bool(np.all(np.isfinite(train_vals)))
         and set(np.unique(train_vals).tolist()).issubset({0, 1, 0.0, 1.0})
-        and all(
-            np.all(np.isfinite(sub_bin[s]))
-            and set(np.unique(sub_bin[s]).tolist()).issubset({0, 1, 0.0, 1.0})
-            for s in ("val", "test")
-        )
     )
-    if is_clean_binary:
-        converted = {
-            s: np.ascontiguousarray(sub_bin[s].astype(np.int64), dtype=np.int64)
-            for s in ("train", "val", "test")
-        }
+    if train_is_clean_binary:
+        converted: dict[str, np.ndarray] = {}
+        for s in ("train", "val", "test"):
+            arr = sub_bin[s]
+            if np.issubdtype(arr.dtype, np.floating):
+                is_zero = np.isfinite(arr) & (arr == 0.0)
+                is_one = np.isfinite(arr) & (arr == 1.0)
+            else:
+                is_zero = arr == 0
+                is_one = arr == 1
+            enc = np.where(is_zero, 0, np.where(is_one, 1, 2)).astype(np.int64)
+            converted[s] = np.ascontiguousarray(enc, dtype=np.int64)
         return converted, [2] * len(keep_cols)
 
     return _transform_cat_oov_safe(sub_bin)
@@ -236,7 +233,6 @@ def preprocess_dataset(
             for s in ("train", "val", "test")
         }
 
-    # Target processing
     target_stats = TargetStats()
     y_proc: dict[str, np.ndarray] = {}
     y_raw_out: dict[str, np.ndarray] = {}
@@ -259,13 +255,20 @@ def preprocess_dataset(
             arr = np.asarray(raw.y[s], dtype=np.int64).reshape(-1)
             y_raw_out[s] = arr
             y_proc[s] = arr
-        n_classes = int(np.unique(y_proc["train"]).size)
+        unique_classes = np.unique(y_proc["train"])
         if raw.task_type == "binclass":
-            if n_classes != 2:
-                raise ValueError(f"binclass requires 2 unique classes in train, got {n_classes}.")
-            d_out = 2  # Official TabM uses d_out=2 + cross_entropy for binclass
+            if not np.array_equal(unique_classes, np.array([0, 1], dtype=np.int64)):
+                raise ValueError(
+                    f"binclass requires train labels {{0, 1}}, got {unique_classes.tolist()}."
+                )
+            d_out = 2
         else:
-            d_out = n_classes
+            expected_classes = np.arange(unique_classes.size, dtype=np.int64)
+            if unique_classes.size < 2 or not np.array_equal(unique_classes, expected_classes):
+                raise ValueError(
+                    f"multiclass requires contiguous train labels 0..C-1, got {unique_classes.tolist()}."
+                )
+            d_out = int(unique_classes.size)
         default_primary = "accuracy"
 
     primary_score = raw.primary_score or default_primary

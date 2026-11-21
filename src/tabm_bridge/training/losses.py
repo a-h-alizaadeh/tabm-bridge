@@ -26,9 +26,9 @@ def compute_independent_loss(
     b, k, d_out = y_pred.shape
 
     if task_type == "regression":
-        if y_true.ndim == 1:
+        if y_true.ndim == 1 and y_true.shape == (b,):
             target = y_true.view(b, 1, 1).expand(b, k, d_out)
-        elif y_true.ndim == 2 and y_true.shape == (b, k):
+        elif y_true.ndim == 2 and y_true.shape == (b, k) and d_out == 1:
             target = y_true.unsqueeze(-1)
         elif y_true.ndim == 2 and y_true.shape == (b, d_out):
             target = y_true.unsqueeze(1).expand(b, k, d_out)
@@ -40,13 +40,16 @@ def compute_independent_loss(
             )
         return F.mse_loss(y_pred, target.to(dtype=y_pred.dtype), reduction="mean")
 
+    if task_type not in ("binclass", "multiclass"):
+        raise ValueError(f"Unsupported task_type: {task_type}")
+
     # Official TabM uses d_out=2 + cross_entropy for binclass and d_out=C for multiclass
     if d_out < 2:
         raise ValueError(
             f"Classification with cross_entropy requires d_out >= 2, got d_out={d_out}."
         )
 
-    if y_true.ndim == 1:
+    if y_true.ndim == 1 and y_true.shape == (b,):
         target_cls = y_true.unsqueeze(1).expand(b, k)
     elif y_true.ndim == 2 and y_true.shape == (b, k):
         target_cls = y_true

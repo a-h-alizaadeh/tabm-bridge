@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import json
 import random
 import time
@@ -93,6 +92,10 @@ class TabMTrainer:
         self.model = model.to(self.device)
 
         # Official AMP rule: bfloat16 ONLY if hardware supports it (commented out float16 in repo)
+        if config.amp_dtype != "bfloat16":
+            raise ValueError(
+                f"Only 'bfloat16' AMP is validated in official TabM (paper/bin/model.py), got {config.amp_dtype!r}."
+            )
         self.amp_enabled = (
             config.use_amp
             and self.device.type == "cuda"
@@ -173,8 +176,11 @@ class TabMTrainer:
                 embs = torch.cat(emb_chunks, dim=0) if return_embeddings else None
                 return preds, embs
             except RuntimeError as exc:
-                is_oom = isinstance(exc, torch.cuda.OutOfMemoryError) or (
-                    "out of memory" in str(exc).lower()
+                msg = str(exc).lower()
+                is_oom = (
+                    isinstance(exc, torch.cuda.OutOfMemoryError)
+                    or "out of memory" in msg
+                    or "cublas_status_alloc_failed" in msg
                 )
                 if is_oom and self._eval_batch_size > 1:
                     self._eval_batch_size = max(1, self._eval_batch_size // 2)
@@ -200,13 +206,24 @@ class TabMTrainer:
                 None,
             )
 
-        probs = torch.softmax(raw_preds, dim=-1)
-        if self.config.classification_agg == "probs":
-            mean_probs = probs.mean(dim=1)
-        else:
-            mean_probs = torch.softmax(raw_preds.mean(dim=1), dim=-1)
+        if self.config.task_type not in ("binclass", "multiclass"):
+            raise ValueError(f"Unsupported task_type: {self.config.task_type}")
 
-        total_ent = -(mean_probs * mean_probs.clamp_min(eps).log()).sum(dim=-1, keepdim=True)
+        if self.config.classification_agg not in ("probs", "logits"):
+            raise ValueError(
+                f"Unsupported classification_agg: {self.config.classification_agg}"
+            )
+
+        probs = torch.softmax(raw_preds, dim=-1)
+        prob_mean = probs.mean(dim=1)
+        mean_probs = (
+            prob_mean
+            if self.config.classification_agg == "probs"
+            else torch.softmax(raw_preds.mean(dim=1), dim=-1)
+        )
+
+        # BALD / Jensen-Shannon Mutual Information strictly uses arithmetic mean of probs
+        total_ent = -(prob_mean * prob_mean.clamp_min(eps).log()).sum(dim=-1, keepdim=True)
         head_ent = -(probs * probs.clamp_min(eps).log()).sum(dim=-1)
         exp_ent = head_ent.mean(dim=1, keepdim=True)
         mutual_info = (total_ent - exp_ent).clamp_min(0.0)

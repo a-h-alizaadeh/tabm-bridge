@@ -1,15 +1,12 @@
-from tabm_bridge.training.losses import compute_independent_loss
-from tabm_bridge.training.trainer import (
-    RepresentationBundle,
-    TabMTrainer,
-    TrainResult,
-    configure_reproducibility,
-)
+from tabm_bridge.config import BridgeConfig, ModelConfig, PLEConfig, TrainConfig
+from tabm_bridge.model import PredictionOutput, TabMModel, TabMOutput
 
 __all__ = [
-    "RepresentationBundle",
-    "TabMTrainer",
-    "TrainResult",
-    "compute_independent_loss",
-    "configure_reproducibility",
+    "BridgeConfig",
+    "ModelConfig",
+    "PLEConfig",
+    "PredictionOutput",
+    "TabMModel",
+    "TabMOutput",
+    "TrainConfig",
 ]

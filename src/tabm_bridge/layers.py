@@ -17,9 +17,9 @@ def _init_scaling_adapter(
 ) -> None:
     """Initialize a (k, d) Rank-1 scaling adapter with optional feature-chunk tying.
 
-    When `init_chunks` is provided (e.g. d_features where sum(init_chunks) == d),
-    a single random scalar is sampled per feature chunk per submodel and repeated
-    across that feature's representation dimensions.
+    Matches official tabm.py (`init_scaling_`):
+      - 'normal': standard normal N(0, 1) via nn.init.normal_
+      - 'random-signs': Rademacher {-1, +1} with equal probability
     """
     k, d = param.shape
     with torch.no_grad():
@@ -27,7 +27,9 @@ def _init_scaling_adapter(
             if scaling_init == "normal":
                 param.normal_(mean=0.0, std=1.0)
             elif scaling_init == "random-signs":
-                param.copy_(torch.randint(0, 2, (k, d), dtype=param.dtype) * 2.0 - 1.0)
+                param.copy_(
+                    torch.randint(0, 2, (k, d), dtype=param.dtype, device=param.device) * 2.0 - 1.0
+                )
             else:
                 raise ValueError(f"Unknown scaling_init: {scaling_init}")
             return
@@ -127,16 +129,15 @@ class LinearBatchEnsemble(nn.Module):
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
         if self.tabm_init:
-            # Per official README: under tabm_init=True, submodels differ ONLY
-            # in the first ensembled layer's R adapter and are identical in all
-            # other adapters and deeper layers at initialization.
             if self.is_first_layer:
                 _init_scaling_adapter(self.r, self.scaling_init, self.init_chunks)
             else:
                 nn.init.ones_(self.r)
             nn.init.ones_(self.s)
         else:
-            _init_scaling_adapter(self.r, self.scaling_init, self.init_chunks if self.is_first_layer else None)
+            _init_scaling_adapter(
+                self.r, self.scaling_init, self.init_chunks if self.is_first_layer else None
+            )
             _init_scaling_adapter(self.s, self.scaling_init, None)
 
         if self.bias is not None:
@@ -144,10 +145,9 @@ class LinearBatchEnsemble(nn.Module):
             bound = 1.0 / math.sqrt(fan_in) if fan_in > 0 else 0.0
             with torch.no_grad():
                 if self.tabm_init:
-                    # Identical bias across all k submodels at initialization
-                    shared_b = torch.empty(1, self.out_features, dtype=self.bias.dtype).uniform_(
-                        -bound, bound
-                    )
+                    shared_b = torch.empty(
+                        1, self.out_features, dtype=self.bias.dtype, device=self.bias.device
+                    ).uniform_(-bound, bound)
                     self.bias.copy_(shared_b.expand(self.k, self.out_features))
                 else:
                     self.bias.uniform_(-bound, bound)

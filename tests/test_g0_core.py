@@ -326,3 +326,40 @@ def test_make_parameter_groups_official_rules() -> None:
             or name.endswith(".s")
         ):
             assert id(param) in decay_ids, f"{name} should receive weight_decay"
+
+def test_batch_ensemble_adapter_gradient_isolation_and_binclass_predict() -> None:
+    torch.manual_seed(0)
+    x_num = torch.randn(8, 5)
+    cfg = ModelConfig(
+        n_num_features=5,
+        d_out=2,
+        variant="tabm",
+        k=6,
+        n_blocks=2,
+        d_block=16,
+        dropout=0.0,
+        ple=PLEConfig(enabled=False),
+    )
+    model = TabMModel(cfg)
+    preds = model(x_num=x_num)
+    assert isinstance(preds, torch.Tensor)
+
+    # Loss depends ONLY on submodel 3 -> adapters r, s, bias of all other heads must get zero grad
+    preds[:, 3, 1].sum().backward()
+    for block in model.blocks:
+        linear = block["linear"]
+        assert isinstance(linear, LinearBatchEnsemble)
+        assert linear.r.grad is not None and linear.s.grad is not None and linear.bias is not None
+        for h in range(cfg.k):
+            if h != 3:
+                assert torch.allclose(linear.r.grad[h], torch.zeros_like(linear.r.grad[h]))
+                assert torch.allclose(linear.s.grad[h], torch.zeros_like(linear.s.grad[h]))
+                assert torch.allclose(linear.bias.grad[h], torch.zeros_like(linear.bias.grad[h]))
+
+    # Official binclass d_out=2 predict path (both probs and logits aggregation)
+    for agg in ("probs", "logits"):
+        out = model.predict(x_num=x_num, task_type="binclass", classification_agg=agg)
+        assert out.mean.shape == (8, 2)
+        assert torch.allclose(out.mean.sum(dim=-1), torch.ones(8), atol=1e-5)
+        assert out.epistemic_uncertainty.shape == (8, 1)
+        assert (out.epistemic_uncertainty >= 0.0).all()

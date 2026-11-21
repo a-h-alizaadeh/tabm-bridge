@@ -195,3 +195,68 @@ def test_metrics_orientation() -> None:
     assert m_bin["accuracy"] == pytest.approx(1.0)
     assert m_bin["roc-auc"] == pytest.approx(1.0)
     assert m_bin["score"] == pytest.approx(1.0)
+
+
+def test_strict_anti_leakage_perturbation_invariance() -> None:
+    raw_clean = _make_synthetic_raw_dataset("regression")
+    raw_corrupt = _make_synthetic_raw_dataset("regression")
+
+    assert raw_corrupt.x_num is not None and raw_corrupt.x_bin is not None
+    # Aggressively corrupt val & test splits (outliers, NaN/unexpected binary values, shifted targets)
+    raw_corrupt.x_num["test"] = raw_corrupt.x_num["test"].copy()
+    raw_corrupt.x_num["test"][:, 0] = 1e6
+    raw_corrupt.x_bin["test"] = raw_corrupt.x_bin["test"].copy()
+    raw_corrupt.x_bin["test"][0, 0] = np.nan
+    raw_corrupt.x_bin["test"][1, 0] = 99.0
+    raw_corrupt.y["test"] = raw_corrupt.y["test"] * 1000.0 + 99999.0
+
+    proc_clean = preprocess_dataset(raw_clean, seed=0)
+    proc_corrupt = preprocess_dataset(raw_corrupt, seed=0)
+
+    # Train split, metadata, and PLE bins must remain bit-for-bit identical (zero leakage)
+    assert proc_clean.cat_cardinalities == proc_corrupt.cat_cardinalities
+    assert proc_clean.target_stats == proc_corrupt.target_stats
+    assert proc_clean.splits["train"].x_num is not None and proc_corrupt.splits["train"].x_num is not None
+    assert np.array_equal(proc_clean.splits["train"].x_num, proc_corrupt.splits["train"].x_num)
+    assert proc_clean.splits["train"].x_cat is not None and proc_corrupt.splits["train"].x_cat is not None
+    assert np.array_equal(proc_clean.splits["train"].x_cat, proc_corrupt.splits["train"].x_cat)
+    assert np.array_equal(proc_clean.splits["train"].y, proc_corrupt.splits["train"].y)
+
+    # Unexpected/NaN values in test binary column (appended as last cat col) must map to OOV index 2
+    assert proc_corrupt.splits["test"].x_cat is not None
+    assert int(proc_corrupt.splits["test"].x_cat[0, -1]) == 2
+    assert int(proc_corrupt.splits["test"].x_cat[1, -1]) == 2
+
+    bins_clean = compute_ple_bins(proc_clean, n_bins=8)
+    bins_corrupt = compute_ple_bins(proc_corrupt, n_bins=8)
+    assert bins_clean is not None and bins_corrupt is not None
+    for b1, b2 in zip(bins_clean, bins_corrupt):
+        assert torch.equal(b1, b2)
+
+
+def test_metrics_multiclass_and_trainer_guards() -> None:
+    m_multi = compute_metrics(
+        np.array([0, 1, 2, 1]),
+        np.array([[0.8, 0.1, 0.1], [0.1, 0.7, 0.2], [0.1, 0.1, 0.8], [0.2, 0.6, 0.2]]),
+        "multiclass",
+    )
+    assert m_multi["accuracy"] == pytest.approx(1.0)
+    assert m_multi["cross-entropy"] > 0.0
+    assert m_multi["score"] == pytest.approx(1.0)
+
+    # Verify trainer rejects unsupported amp_dtype
+    raw = _make_synthetic_raw_dataset("regression")
+    proc = preprocess_dataset(raw, seed=0)
+    model = TabMModel(
+        ModelConfig.make(
+            n_num_features=proc.n_num_features,
+            cat_cardinalities=proc.cat_cardinalities,
+            d_out=1,
+            variant="mlp",
+            d_block=16,
+            ple=PLEConfig(enabled=False),
+        )
+    )
+    bad_cfg = TrainConfig(task_type="regression", device="cpu", amp_dtype="float16")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="bfloat16"):
+        TabMTrainer(model=model, config=bad_cfg, target_stats=proc.target_stats)

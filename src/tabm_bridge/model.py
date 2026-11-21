@@ -174,7 +174,24 @@ class TabMModel(nn.Module):
         parts: list[torch.Tensor] = []
         ref_dtype = torch.float32
 
-        if x_num is not None:
+        if self.config.n_num_features > 0 and x_num is None:
+            raise ValueError(
+                f"Expected x_num with {self.config.n_num_features} features, got None."
+            )
+        if self.config.n_bin_features > 0 and x_bin is None:
+            raise ValueError(
+                f"Expected x_bin with {self.config.n_bin_features} features, got None."
+            )
+        if len(self.cat_cardinalities) > 0 and x_cat is None:
+            raise ValueError(
+                f"Expected x_cat with {len(self.cat_cardinalities)} features, got None."
+            )
+
+        if x_num is not None and self.config.n_num_features > 0:
+            if x_num.shape[-1] != self.config.n_num_features:
+                raise ValueError(
+                    f"Expected {self.config.n_num_features} numerical cols, got {x_num.shape[-1]}."
+                )
             ref_dtype = x_num.dtype
             if self.num_embeddings is not None:
                 if x_num.ndim == 3:
@@ -187,7 +204,11 @@ class TabMModel(nn.Module):
             else:
                 parts.append(x_num)
 
-        if x_bin is not None:
+        if x_bin is not None and self.config.n_bin_features > 0:
+            if x_bin.shape[-1] != self.config.n_bin_features:
+                raise ValueError(
+                    f"Expected {self.config.n_bin_features} binary cols, got {x_bin.shape[-1]}."
+                )
             ref_dtype = x_bin.dtype if x_num is None else ref_dtype
             parts.append(x_bin.to(dtype=ref_dtype))
 
@@ -304,9 +325,19 @@ class TabMModel(nn.Module):
                     epistemic_uncertainty=epistemic_std,
                 )
 
+            if task_type not in ("binclass", "multiclass"):
+                raise ValueError(f"Unsupported task_type: {task_type}")
+
+            if classification_agg not in ("probs", "logits"):
+                raise ValueError(f"Unsupported classification_agg: {classification_agg}")
+
             if task_type == "binclass" and raw_preds.shape[-1] == 1:
                 probs = torch.sigmoid(raw_preds)
-                mean = probs.mean(dim=1) if classification_agg == "probs" else torch.sigmoid(raw_preds.mean(dim=1))
+                mean = (
+                    probs.mean(dim=1)
+                    if classification_agg == "probs"
+                    else torch.sigmoid(raw_preds.mean(dim=1))
+                )
                 epistemic_std = probs.std(dim=1, unbiased=False)
                 return PredictionOutput(
                     mean=mean,
@@ -314,15 +345,18 @@ class TabMModel(nn.Module):
                     epistemic_uncertainty=epistemic_std,
                 )
 
-            # Multiclass (or 2-logit binclass)
+            # Multiclass (or official 2-logit binclass)
             probs = torch.softmax(raw_preds, dim=-1)
-            if classification_agg == "probs":
-                mean_probs = probs.mean(dim=1)
-            else:
-                mean_probs = torch.softmax(raw_preds.mean(dim=1), dim=-1)
+            prob_mean = probs.mean(dim=1)
+            mean_probs = (
+                prob_mean
+                if classification_agg == "probs"
+                else torch.softmax(raw_preds.mean(dim=1), dim=-1)
+            )
 
-            total_entropy = -(mean_probs * (mean_probs.clamp_min(eps)).log()).sum(dim=-1, keepdim=True)
-            head_entropy = -(probs * (probs.clamp_min(eps)).log()).sum(dim=-1)
+            # BALD / Jensen-Shannon Mutual Information strictly uses arithmetic mean of probs
+            total_entropy = -(prob_mean * prob_mean.clamp_min(eps).log()).sum(dim=-1, keepdim=True)
+            head_entropy = -(probs * probs.clamp_min(eps).log()).sum(dim=-1)
             expected_entropy = head_entropy.mean(dim=1, keepdim=True)
             mutual_info = (total_entropy - expected_entropy).clamp_min(0.0)
 

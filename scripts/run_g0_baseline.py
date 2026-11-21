@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from tabm_bridge.training import TabMTrainer, configure_reproducibility
 from tabm_bridge.config import ModelConfig, PLEConfig, TrainConfig, VariantType
 from tabm_bridge.data import (
     ProcessedDataset,
@@ -268,6 +269,15 @@ def main() -> None:
                 compile_model=args.compile,
                 seed=seed,
                 device=args.device,
+            )
+
+            configure_reproducibility(seed)
+            model = TabMModel(model_cfg, ple_bins=ple_bins)
+            trainer = TabMTrainer(
+                model=model,
+                config=train_cfg,
+                target_stats=dataset.target_stats,
+                primary_score=dataset.primary_score,
             )
 
             model = TabMModel(model_cfg, ple_bins=ple_bins)

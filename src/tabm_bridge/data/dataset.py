@@ -72,7 +72,10 @@ def download_official_tabm_data(
         urllib.request.urlretrieve(OFFICIAL_TABM_DATA_URL, tar_path)
 
     with tarfile.open(tar_path, "r:*") as tar:
-        tar.extractall(path=out_dir)
+        try:
+            tar.extractall(path=out_dir, filter="data")
+        except TypeError:
+            tar.extractall(path=out_dir)
 
     return out_dir
 

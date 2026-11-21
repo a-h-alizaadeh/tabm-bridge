@@ -1,3 +1,39 @@
+from tabm_bridge.evaluation.g1_probes import (
+    AuxTransferResult,
+    CosineKNNScorer,
+    KNNGeometryResult,
+    LinearProbeResult,
+    MahalanobisScorer,
+    OODResult,
+    UQFidelityResult,
+    UnifiedSpaceOODReport,
+    compute_gap_recovery,
+    evaluate_auxiliary_transfer,
+    evaluate_knn_geometry,
+    evaluate_linear_probe,
+    evaluate_ood_scores,
+    evaluate_unified_space_ood,
+    evaluate_uq_fidelity,
+    select_auxiliary_features,
+)
 from tabm_bridge.evaluation.metrics import compute_metrics
 
-__all__ = ["compute_metrics"]
+__all__ = [
+    "AuxTransferResult",
+    "CosineKNNScorer",
+    "KNNGeometryResult",
+    "LinearProbeResult",
+    "MahalanobisScorer",
+    "OODResult",
+    "UQFidelityResult",
+    "UnifiedSpaceOODReport",
+    "compute_gap_recovery",
+    "compute_metrics",
+    "evaluate_auxiliary_transfer",
+    "evaluate_knn_geometry",
+    "evaluate_linear_probe",
+    "evaluate_ood_scores",
+    "evaluate_unified_space_ood",
+    "evaluate_uq_fidelity",
+    "select_auxiliary_features",
+]

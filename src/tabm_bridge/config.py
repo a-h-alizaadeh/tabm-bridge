@@ -126,14 +126,14 @@ class BridgeConfig:
     align_rank: int = 16
     center_gram: bool = True             # Batch-centered Gram: invariant to O(d) rotations + shifts
     dropout: float = 0.1
-    alpha_gram: float = 1.0
+    alpha_gram: float = 25.0
     alpha_pred: float = 1.0
-    alpha_uq: float = 0.5
+    alpha_uq: float = 0.15
     stop_gradient: bool = True           # Set False ONLY in Learner Collusion ablation
     lr: float = 1e-3
     weight_decay: float = 1e-4
-    epochs: int = 50
-    patience: int = 10
+    epochs: int = 60
+    patience: int = 12
     batch_size: int = 256
 
     def __post_init__(self) -> None:

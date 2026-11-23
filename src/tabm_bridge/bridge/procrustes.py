@@ -4,6 +4,11 @@ from dataclasses import dataclass
 
 import numpy as np
 
+try:
+    import torch
+except ImportError:  # pragma: no cover
+    torch = None  # type: ignore[assignment]
+
 
 @dataclass
 class MisalignmentDiagnostics:
@@ -62,6 +67,7 @@ class GeneralizedOrthogonalProcrustes:
         max_fit_samples: int | None = 8192,
         batch_size: int = 2048,
         random_state: int = 42,
+        device: str = "auto",
     ) -> None:
         self.center = center
         self.max_iter = max_iter
@@ -69,11 +75,69 @@ class GeneralizedOrthogonalProcrustes:
         self.max_fit_samples = max_fit_samples
         self.batch_size = batch_size
         self.random_state = random_state
+        self.device = device
 
         self.means_: np.ndarray | None = None        # (k, d)
         self.rotations_: np.ndarray | None = None    # (k, d, d)
         self.n_iter_: int = 0
         self.obj_history_: list[float] = []
+
+    def _should_use_cuda(self, k: int, d: int) -> bool:
+        if torch is None or not torch.cuda.is_available():
+            return False
+        if self.device == "cpu":
+            return False
+        if self.device.startswith("cuda"):
+            return True
+        # Auto mode: use GPU for large TabM tensors (e.g. k=32, d=512); keep tiny mats on CPU f64
+        return (k * d * d) >= 1_000_000
+
+    def _fit_cuda(self, sub_arr: np.ndarray) -> None:
+        assert torch is not None
+        cuda_dev = torch.device("cuda" if self.device == "auto" else self.device)
+        n_sub, k, d = sub_arr.shape
+
+        with torch.no_grad():
+            hc = torch.from_numpy(np.ascontiguousarray(sub_arr, dtype=np.float32)).to(cuda_dev)
+            if self.center:
+                means_t = hc.mean(dim=0)  # (k, d)
+                hc.sub_(means_t.unsqueeze(0))
+            else:
+                means_t = torch.zeros((k, d), dtype=torch.float32, device=cuda_dev)
+
+            total_norm_sq = float((hc * hc).sum().item())
+            consensus = hc.mean(dim=1)  # (N_sub, d)
+            if float(torch.linalg.norm(consensus).item()) < 1e-8:
+                consensus = hc[:, 0, :].clone()
+
+            # (k, N_sub, d) for batched GEMM; free hc to keep peak VRAM ~1 GB
+            h_knd = hc.permute(1, 0, 2).contiguous()
+            del hc
+
+            rotations_t = torch.eye(d, dtype=torch.float32, device=cuda_dev).unsqueeze(0).expand(k, d, d).clone()
+            prev_obj: float | None = None
+            denom = float(k * n_sub)
+
+            for it in range(1, self.max_iter + 1):
+                # Batched cross-covariance: (k, d, N_sub) @ (1, N_sub, d) -> (k, d, d)
+                cross = torch.matmul(h_knd.transpose(1, 2), consensus.unsqueeze(0))
+                u, _, vh = torch.linalg.svd(cross, full_matrices=False)
+                rotations_t = torch.bmm(u, vh)
+                consensus = torch.bmm(h_knd, rotations_t).mean(dim=0)
+
+                consensus_norm_sq = float((consensus * consensus).sum().item())
+                obj = max(0.0, (total_norm_sq - float(k) * consensus_norm_sq) / denom)
+                self.obj_history_.append(obj)
+                self.n_iter_ = it
+
+                if prev_obj is not None:
+                    rel_improv = abs(prev_obj - obj) / max(abs(prev_obj), 1e-12)
+                    if rel_improv < self.tol:
+                        break
+                prev_obj = obj
+
+            self.means_ = means_t.cpu().numpy().astype(np.float32, copy=False)
+            self.rotations_ = rotations_t.cpu().numpy().astype(np.float32, copy=False)
 
     def fit(self, embeddings_train: np.ndarray) -> GeneralizedOrthogonalProcrustes:
         arr = np.asarray(embeddings_train)
@@ -84,9 +148,28 @@ class GeneralizedOrthogonalProcrustes:
         if self.max_fit_samples is not None and n > self.max_fit_samples:
             rng = np.random.default_rng(self.random_state)
             idx = rng.choice(n, size=self.max_fit_samples, replace=False)
-            centered = arr[idx].astype(np.float64, copy=True)
+            sub_view = arr[idx]
         else:
-            centered = arr.astype(np.float64, copy=True)
+            sub_view = arr
+
+        self.obj_history_ = []
+        if k == 1:
+            means = (
+                sub_view.astype(np.float64, copy=False).mean(axis=0)
+                if self.center
+                else np.zeros((1, d), dtype=np.float64)
+            )
+            self.means_ = means.astype(np.float32)
+            self.rotations_ = np.eye(d, dtype=np.float32)[None, :, :]
+            self.n_iter_ = 0
+            return self
+
+        if self._should_use_cuda(k, d):
+            self._fit_cuda(sub_view)
+            return self
+
+        # Exact float64 CPU path (used when CUDA is unavailable or for small matrices)
+        centered = sub_view.astype(np.float64, copy=True)
 
         # In-place per-branch centering strictly on train (halves peak RAM)
         if self.center:
@@ -96,12 +179,6 @@ class GeneralizedOrthogonalProcrustes:
             means = np.zeros((k, d), dtype=np.float64)
 
         rotations = np.broadcast_to(np.eye(d, dtype=np.float64), (k, d, d)).copy()
-        self.obj_history_ = []
-        if k == 1:
-            self.means_ = means.astype(np.float32)
-            self.rotations_ = rotations.astype(np.float32)
-            self.n_iter_ = 0
-            return self
 
         # Exact orthogonal invariance identity:
         #   sum_i ||H_i Q_i - M||_F^2 = sum_i ||H_i||_F^2 - k * ||M||_F^2

@@ -7,11 +7,37 @@ import numpy as np
 from scipy.stats import spearmanr
 from sklearn.covariance import LedoitWolf
 from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.metrics import average_precision_score, r2_score, roc_auc_score, root_mean_squared_error, silhouette_score
-from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    average_precision_score,
+    r2_score,
+    roc_auc_score,
+    root_mean_squared_error,
+    silhouette_score,
+)
 
 from tabm_bridge.config import TaskType
 from tabm_bridge.evaluation.metrics import compute_metrics
+
+DEFAULT_REG_GRID_REGRESSION: tuple[float, ...] = (
+    1e-3,
+    1e-2,
+    1e-1,
+    1.0,
+    10.0,
+    100.0,
+    1e3,
+    1e4,
+    1e5,
+)
+DEFAULT_REG_GRID_CLASSIFICATION: tuple[float, ...] = (
+    1e-3,
+    1e-2,
+    1e-1,
+    1.0,
+    10.0,
+    100.0,
+    1000.0,
+)
 
 
 def _safe_spearman(x: np.ndarray, y: np.ndarray) -> float:
@@ -28,6 +54,95 @@ def _l2_normalize(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     arr = np.asarray(x, dtype=np.float32)
     norms = np.linalg.norm(arr, axis=-1, keepdims=True)
     return arr / np.clip(norms, eps, None)
+
+
+def _isotropic_scale(
+    z_train: np.ndarray,
+    z_val: np.ndarray,
+    z_test: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Rotation-invariant centering + global RMS scaling in float64 (strictly train-fitted).
+
+    Unlike per-coordinate StandardScaler, isotropic scaling preserves orthogonal geometry
+    and prevents near-dead embedding dimensions from causing ill-conditioned Ridge blowups.
+    """
+    x_tr = np.asarray(z_train, dtype=np.float64)
+    x_va = np.asarray(z_val, dtype=np.float64)
+    x_te = np.asarray(z_test, dtype=np.float64)
+
+    mu = x_tr.mean(axis=0, keepdims=True)
+    x_tr_c = x_tr - mu
+    scale = float(np.sqrt(np.mean(x_tr_c * x_tr_c)))
+    if not np.isfinite(scale) or scale < 1e-12:
+        scale = 1.0
+    return x_tr_c / scale, (x_va - mu) / scale, (x_te - mu) / scale
+
+
+def _prepare_ridge_svd(
+    x_tr_s: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Compute exact thin float64 SVD once for fast, warning-free multi-alpha Ridge."""
+    if x_tr_s.shape[1] > 2048:
+        return None
+    u, s, vt = np.linalg.svd(x_tr_s, full_matrices=False)
+    return u, s, vt
+
+
+def _fit_ridge_1d_val_select(
+    x_tr_s: np.ndarray,
+    y_tr: np.ndarray,
+    x_va_s: np.ndarray,
+    y_va: np.ndarray,
+    x_te_s: np.ndarray,
+    reg_grid: tuple[float, ...],
+    svd_cache: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+    seed: int = 42,
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """Select optimal L2 alpha strictly on val RMSE using exact float64 SVD (or lsqr if d>2048)."""
+    y0 = np.asarray(y_tr, dtype=np.float64).reshape(-1)
+    y1 = np.asarray(y_va, dtype=np.float64).reshape(-1)
+    y_mean = float(y0.mean())
+
+    best_alpha = float(reg_grid[0])
+    best_val_rmse = float("inf")
+    best_pred_va: np.ndarray | None = None
+    best_pred_te: np.ndarray | None = None
+
+    if svd_cache is not None:
+        u, s, vt = svd_cache
+        s2 = s * s
+        uty = u.T @ (y0 - y_mean)
+        best_w: np.ndarray | None = None
+        for alpha in reg_grid:
+            a = float(alpha)
+            w = vt.T @ ((s / (s2 + a)) * uty)
+            pred_va = x_va_s @ w + y_mean
+            val_rmse = float(root_mean_squared_error(y1, pred_va))
+            if val_rmse < best_val_rmse:
+                best_val_rmse = val_rmse
+                best_alpha = a
+                best_w = w
+                best_pred_va = pred_va
+        assert best_w is not None and best_pred_va is not None
+        best_pred_te = x_te_s @ best_w + y_mean
+        return best_alpha, best_pred_va, best_pred_te
+
+    # High-dimensional fallback (e.g., ConcatBaseline with d > 2048)
+    best_model: Ridge | None = None
+    for alpha in reg_grid:
+        a = float(alpha)
+        model = Ridge(alpha=a, solver="lsqr", random_state=seed)
+        model.fit(x_tr_s, y0 - y_mean)
+        pred_va = model.predict(x_va_s) + y_mean
+        val_rmse = float(root_mean_squared_error(y1, pred_va))
+        if val_rmse < best_val_rmse:
+            best_val_rmse = val_rmse
+            best_alpha = a
+            best_model = model
+            best_pred_va = pred_va
+    assert best_model is not None and best_pred_va is not None
+    best_pred_te = best_model.predict(x_te_s) + y_mean
+    return best_alpha, best_pred_va, best_pred_te
 
 
 def _chunked_cosine_topk(
@@ -95,49 +210,59 @@ def evaluate_linear_probe(
     y_test_raw: np.ndarray,
     task_type: TaskType,
     primary_score: str | None = None,
-    reg_grid: tuple[float, ...] = (1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0, 1000.0),
+    reg_grid: tuple[float, ...] | None = None,
     seed: int = 42,
 ) -> LinearProbeResult:
-    """Fit StandardScaler + L2-regularized linear probe strictly on train; tune on val."""
-    x_tr = np.asarray(z_train, dtype=np.float32)
-    x_va = np.asarray(z_val, dtype=np.float32)
-    x_te = np.asarray(z_test, dtype=np.float32)
-
-    scaler = StandardScaler()
-    x_tr_s = scaler.fit_transform(x_tr)
-    x_va_s = scaler.transform(x_va)
-    x_te_s = scaler.transform(x_te)
-
-    best_param = reg_grid[0]
-    best_val_score = -float("inf")
-    best_val_metrics: dict[str, float] = {}
-    best_model: Any = None
+    """Fit isotropic float64 scaler + L2-regularized linear probe strictly on train; tune on val."""
+    x_tr_s, x_va_s, x_te_s = _isotropic_scale(z_train, z_val, z_test)
 
     if task_type == "regression":
+        grid = reg_grid if reg_grid is not None else DEFAULT_REG_GRID_REGRESSION
         y_tr = np.asarray(y_train_raw, dtype=np.float64).reshape(-1)
         y_va = np.asarray(y_val_raw, dtype=np.float64).reshape(-1)
         y_te = np.asarray(y_test_raw, dtype=np.float64).reshape(-1)
-
         y_mean = float(y_tr.mean())
-        y_std = float(y_tr.std(ddof=0))
-        if y_std < 1e-12:
-            y_std = 1.0
-        y_tr_std = (y_tr - y_mean) / y_std
 
-        solver = "lsqr" if x_tr_s.shape[1] > 2048 else "auto"
-        for alpha in reg_grid:
-            model = Ridge(alpha=float(alpha), solver=solver, random_state=seed)
-            model.fit(x_tr_s, y_tr_std)
-            pred_va = model.predict(x_va_s) * y_std + y_mean
-            m_va = compute_metrics(y_va, pred_va, task_type, primary_score)
-            if m_va["score"] > best_val_score:
-                best_val_score = m_va["score"]
-                best_val_metrics = m_va
-                best_param = float(alpha)
-                best_model = model
+        svd_cache = _prepare_ridge_svd(x_tr_s)
+        best_param = float(grid[0])
+        best_val_score = -float("inf")
+        best_val_metrics: dict[str, float] = {}
+        best_pred_te: np.ndarray | None = None
 
-        pred_te = best_model.predict(x_te_s) * y_std + y_mean
-        m_te = compute_metrics(y_te, pred_te, task_type, primary_score)
+        if svd_cache is not None:
+            u, s, vt = svd_cache
+            s2 = s * s
+            uty = u.T @ (y_tr - y_mean)
+            best_w: np.ndarray | None = None
+            for alpha in grid:
+                a = float(alpha)
+                w = vt.T @ ((s / (s2 + a)) * uty)
+                pred_va = x_va_s @ w + y_mean
+                m_va = compute_metrics(y_va, pred_va, task_type, primary_score)
+                if m_va["score"] > best_val_score:
+                    best_val_score = m_va["score"]
+                    best_val_metrics = m_va
+                    best_param = a
+                    best_w = w
+            assert best_w is not None
+            best_pred_te = x_te_s @ best_w + y_mean
+        else:
+            best_model_r: Ridge | None = None
+            for alpha in grid:
+                a = float(alpha)
+                model = Ridge(alpha=a, solver="lsqr", random_state=seed)
+                model.fit(x_tr_s, y_tr - y_mean)
+                pred_va = model.predict(x_va_s) + y_mean
+                m_va = compute_metrics(y_va, pred_va, task_type, primary_score)
+                if m_va["score"] > best_val_score:
+                    best_val_score = m_va["score"]
+                    best_val_metrics = m_va
+                    best_param = a
+                    best_model_r = model
+            assert best_model_r is not None
+            best_pred_te = best_model_r.predict(x_te_s) + y_mean
+
+        m_te = compute_metrics(y_te, best_pred_te, task_type, primary_score)
         return LinearProbeResult(
             best_reg_param=best_param,
             val_metrics=best_val_metrics,
@@ -148,6 +273,7 @@ def evaluate_linear_probe(
     if task_type not in ("binclass", "multiclass"):
         raise ValueError(f"Unsupported task_type: {task_type}")
 
+    grid = reg_grid if reg_grid is not None else DEFAULT_REG_GRID_CLASSIFICATION
     y_tr_c = np.asarray(y_train_raw, dtype=np.int64).reshape(-1)
     y_va_c = np.asarray(y_val_raw, dtype=np.int64).reshape(-1)
     y_te_c = np.asarray(y_test_raw, dtype=np.int64).reshape(-1)
@@ -162,7 +288,12 @@ def evaluate_linear_probe(
             full[:, int(cls_label)] = raw_p[:, col_idx]
         return full
 
-    for c_val in reg_grid:
+    best_param = float(grid[0])
+    best_val_score = -float("inf")
+    best_val_metrics = {}
+    best_model: Any = None
+
+    for c_val in grid:
         clf = LogisticRegression(
             C=float(c_val),
             solver="lbfgs",
@@ -354,7 +485,7 @@ def evaluate_auxiliary_transfer(
     z_test: np.ndarray,
     aux_test: np.ndarray,
     feature_indices: list[int] | None = None,
-    reg_grid: tuple[float, ...] = (1e-2, 1e-1, 1.0, 10.0, 100.0, 1000.0),
+    reg_grid: tuple[float, ...] = DEFAULT_REG_GRID_REGRESSION,
     seed: int = 42,
 ) -> AuxTransferResult:
     """Evaluate linear decodability of held-out / auxiliary attributes from frozen z(x)."""
@@ -367,28 +498,23 @@ def evaluate_auxiliary_transfer(
     n_feat = a_tr.shape[1]
     indices = feature_indices if feature_indices is not None else list(range(n_feat))
 
-    scaler = StandardScaler()
-    x_tr_s = scaler.fit_transform(np.asarray(z_train, dtype=np.float32))
-    x_va_s = scaler.transform(np.asarray(z_val, dtype=np.float32))
-    x_te_s = scaler.transform(np.asarray(z_test, dtype=np.float32))
-    solver = "lsqr" if x_tr_s.shape[1] > 2048 else "auto"
+    x_tr_s, x_va_s, x_te_s = _isotropic_scale(z_train, z_val, z_test)
+    svd_cache = _prepare_ridge_svd(x_tr_s)
 
     r2_list: list[float] = []
     rmse_list: list[float] = []
 
     for j in range(n_feat):
-        best_rmse = float("inf")
-        best_model: Ridge | None = None
-        for alpha in reg_grid:
-            model = Ridge(alpha=float(alpha), solver=solver, random_state=seed)
-            model.fit(x_tr_s, a_tr[:, j])
-            pred_va = model.predict(x_va_s)
-            val_rmse = float(root_mean_squared_error(a_va[:, j], pred_va))
-            if val_rmse < best_rmse:
-                best_rmse = val_rmse
-                best_model = model
-        assert best_model is not None
-        pred_te = best_model.predict(x_te_s)
+        _, _, pred_te = _fit_ridge_1d_val_select(
+            x_tr_s=x_tr_s,
+            y_tr=a_tr[:, j],
+            x_va_s=x_va_s,
+            y_va=a_va[:, j],
+            x_te_s=x_te_s,
+            reg_grid=reg_grid,
+            svd_cache=svd_cache,
+            seed=seed,
+        )
         r2_list.append(float(r2_score(a_te[:, j], pred_te)))
         rmse_list.append(float(root_mean_squared_error(a_te[:, j], pred_te)))
 
@@ -419,7 +545,7 @@ def evaluate_uq_fidelity(
     z_test: np.ndarray,
     uq_test: np.ndarray,
     direct_uq_test: np.ndarray | None = None,
-    reg_grid: tuple[float, ...] = (1e-2, 1e-1, 1.0, 10.0, 100.0, 1000.0),
+    reg_grid: tuple[float, ...] = DEFAULT_REG_GRID_REGRESSION,
     seed: int = 42,
 ) -> UQFidelityResult:
     """Measure how faithfully ensemble epistemic uncertainty can be read from z(x)."""
@@ -431,25 +557,19 @@ def evaluate_uq_fidelity(
     u_va = np.log1p(u_va_raw)
     u_te = np.log1p(u_te_raw)
 
-    scaler = StandardScaler()
-    x_tr_s = scaler.fit_transform(np.asarray(z_train, dtype=np.float32))
-    x_va_s = scaler.transform(np.asarray(z_val, dtype=np.float32))
-    x_te_s = scaler.transform(np.asarray(z_test, dtype=np.float32))
-    solver = "lsqr" if x_tr_s.shape[1] > 2048 else "auto"
+    x_tr_s, x_va_s, x_te_s = _isotropic_scale(z_train, z_val, z_test)
+    svd_cache = _prepare_ridge_svd(x_tr_s)
 
-    best_rmse = float("inf")
-    best_model: Ridge | None = None
-    for alpha in reg_grid:
-        model = Ridge(alpha=float(alpha), solver=solver, random_state=seed)
-        model.fit(x_tr_s, u_tr)
-        pred_va = model.predict(x_va_s)
-        val_rmse = float(root_mean_squared_error(u_va, pred_va))
-        if val_rmse < best_rmse:
-            best_rmse = val_rmse
-            best_model = model
-
-    assert best_model is not None
-    pred_te_log = best_model.predict(x_te_s)
+    _, _, pred_te_log = _fit_ridge_1d_val_select(
+        x_tr_s=x_tr_s,
+        y_tr=u_tr,
+        x_va_s=x_va_s,
+        y_va=u_va,
+        x_te_s=x_te_s,
+        reg_grid=reg_grid,
+        svd_cache=svd_cache,
+        seed=seed,
+    )
     probe_rho = _safe_spearman(u_te_raw, pred_te_log)
     probe_r2 = float(r2_score(u_te, pred_te_log)) if float(np.std(u_te)) >= 1e-12 else 0.0
 

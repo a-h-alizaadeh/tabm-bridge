@@ -12,6 +12,7 @@ from tabm_bridge.bridge.procrustes import (
 from tabm_bridge.bridge.tabm_bridge import (
     BridgeOutput,
     BridgeTrainResult,
+    ProcrustesAnchoredResidualBridge,
     TabMBridge,
     TabMBridgeTrainer,
     compute_bridge_losses,
@@ -25,6 +26,7 @@ __all__ = [
     "GeneralizedOrthogonalProcrustes",
     "MisalignmentDiagnostics",
     "PCAConcatBaseline",
+    "ProcrustesAnchoredResidualBridge",
     "SimpleMeanBaseline",
     "TabMBestSubmodelBaseline",
     "TabMBridge",

@@ -118,7 +118,7 @@ class TrainConfig:
 
 @dataclass
 class BridgeConfig:
-    """Configuration for Scenario 1 (G1): TabM-Bridge consensus bottleneck."""
+    """Configuration for Scenario 1 (G1) TabM-Bridge (v1 & v2 Procrustes-Anchored Residual)."""
 
     d_z: int = 256
     d_hidden: int = 256
@@ -135,11 +135,33 @@ class BridgeConfig:
     epochs: int = 60
     patience: int = 12
     batch_size: int = 256
+    # v4.0 extensions (backward-compatible defaults preserve exact v3.1 behavior)
+    alpha_recon: float = 0.0             # Trust-region anchor reconstruction weight (Bridge-v2)
+    init_gate: float = 0.05              # Non-zero learnable residual gate init (Bridge-v2)
+    gram_warmup_epochs: int = 0          # Cosine warmup epochs for alpha_gram (>0 in Bridge-v2)
+    use_cosine_lr: bool = False          # CosineAnnealingLR schedule
+    mask_gram_diag: bool = False         # Exclude trivial 1.0 diagonal entries in Gram MSE
+    center_z_gram: bool = False          # Symmetric batch-centering of z inside G_z
 
     def __post_init__(self) -> None:
         if self.d_z < 1 or self.d_hidden < 1:
             raise ValueError(f"d_z and d_hidden must be >= 1, got {self.d_z}, {self.d_hidden}.")
         if self.align_mode == "low_rank" and self.align_rank < 1:
-            raise ValueError(f"align_rank must be >= 1 when align_mode='low_rank', got {self.align_rank}.")
+            raise ValueError(
+                f"align_rank must be >= 1 when align_mode='low_rank', got {self.align_rank}."
+            )
         if not (0.0 <= self.dropout < 1.0):
             raise ValueError(f"dropout must be in [0, 1), got {self.dropout}.")
+        if (
+            self.alpha_recon < 0.0
+            or self.alpha_gram < 0.0
+            or self.alpha_pred < 0.0
+            or self.alpha_uq < 0.0
+        ):
+            raise ValueError("All loss weights must be non-negative.")
+        if self.gram_warmup_epochs < 0:
+            raise ValueError(f"gram_warmup_epochs must be >= 0, got {self.gram_warmup_epochs}.")
+        if self.init_gate == 0.0:
+            raise ValueError(
+                "init_gate must be non-zero to avoid a zero-gradient saddle point with zero-init refine_fc2."
+            )
